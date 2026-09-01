@@ -23,23 +23,41 @@ Exemple de contenu de `Liste MC et %` :
 road trip en italie (320): 22.22 % | visiter italie en 10 jours (10): 22.22 %
 ```
 
-**Limite connue** : un mot-clé cité uniquement dans `Liste MC et %` mais qui n'a
-jamais sa propre ligne `Mot-clé` dans le fichier n'est pas intégré au clustering
-(il n'existe pas de volume propre pour ce mot-clé dans le fichier).
+**Limites connues** :
+- Un mot-clé cité uniquement dans `Liste MC et %` mais qui n'a jamais sa propre
+  ligne `Mot-clé` dans le fichier n'est pas intégré au clustering (il n'existe
+  pas de volume propre pour ce mot-clé dans le fichier). L'application détecte
+  désormais ces "mots-clés fantômes" et affiche un avertissement listant les
+  plus importants (par volume rapporté), pour que vous puissiez juger si votre
+  export source est incomplet.
+- Les fichiers de plus de 20 000 lignes sont refusés avec un message explicite
+  (voir `clustering.MAX_ROWS`), afin d'éviter un calcul trop long ou une UI qui
+  se bloque. Scindez le fichier en plusieurs exports plus petits si nécessaire.
 
 ## Fonctionnement
 
-1. **Import** du fichier (CSV ou Excel), avec validation des colonnes requises.
-2. **Nettoyage** automatique de la colonne volume (espaces, virgules, valeurs invalides → 0).
-3. **Aperçu** des données brutes avant traitement.
-4. **Seuil de similarité** ajustable via un slider (0 à 100 %) : seuls les mots-clés
+1. **Import** du fichier (CSV ou Excel), avec validation des colonnes requises
+   et de la taille du fichier (20 000 lignes max).
+2. **Déduplication** des mots-clés apparaissant plusieurs fois dans le fichier
+   source : le volume maximal est conservé et toutes leurs relations de
+   similarité sont fusionnées (au lieu que la dernière ligne rencontrée
+   écrase silencieusement les précédentes). Un avertissement liste les
+   mots-clés concernés.
+3. **Détection des mots-clés fantômes** (voir ci-dessus), avec avertissement
+   listant les plus gros volumes non intégrés.
+4. **Nettoyage** automatique de la colonne volume (espaces, virgules, valeurs invalides → 0).
+5. **Aperçu** des données brutes avant traitement.
+6. **Seuil de similarité** ajustable via un slider (0 à 100 %) : seuls les mots-clés
    dont la similarité dépasse le seuil sont retenus comme candidats à la fusion.
-5. **Clustering par composantes connexes** : les mots-clés liés (directement ou
+7. **Clustering par composantes connexes** : les mots-clés liés (directement ou
    via une chaîne de similarités, ex. A~B~C) sont regroupés dans un même cluster,
-   avec pour représentant le mot-clé au volume le plus élevé.
-6. **Résultat** : un tableau avec le mot-clé principal, les mots-clés fusionnés,
+   avec pour représentant le mot-clé au volume le plus élevé. Le calcul de la
+   similarité moyenne par cluster se fait en un seul passage sur les relations
+   (O(E)), et non par comparaison de toutes les paires de membres d'un cluster
+   (évite une complexité O(k²) mesurable sur de gros clusters interconnectés).
+8. **Résultat** : un tableau avec le mot-clé principal, les mots-clés fusionnés,
    le volume cumulé du cluster et la similarité moyenne.
-7. **Export** du résultat en Excel, généré en mémoire (aucune écriture disque).
+9. **Export** du résultat en Excel, généré en mémoire (aucune écriture disque).
 
 Le chargement du fichier et le clustering sont mis en cache (`st.cache_data`)
 pour éviter de tout recalculer à chaque déplacement du slider.
@@ -48,12 +66,13 @@ pour éviter de tout recalculer à chaque déplacement du slider.
 
 ```
 .
-├── streamlit_app.py       # Interface Streamlit (UI uniquement)
-├── clustering.py          # Logique métier pure (parsing, clustering, export)
+├── streamlit_app.py       # Interface Streamlit (UI + orchestration mise en cache)
+├── clustering.py          # Logique métier pure (parsing, dedup, clustering, export)
 ├── test_clustering.py     # Tests unitaires (pytest)
 ├── requirements.txt       # Dépendances de production
 ├── requirements-dev.txt   # Dépendances de développement (pytest)
 ├── .streamlit/config.toml # Thème Streamlit (dark, violet)
+├── .github/workflows/     # CI : exécution des tests à chaque push/PR
 └── todo.txt                # Roadmap
 ```
 
@@ -71,12 +90,25 @@ pour éviter de tout recalculer à chaque déplacement du slider.
 - Slider de seuil au lieu d'un champ numérique, avec valeur par défaut plus
   réaliste (25 % au lieu de 40 %).
 - Libellés entièrement en français.
-- **Nouveau** : fichier de thème déplacé vers `.streamlit/config.toml` (l'ancien
-  emplacement à la racine n'était jamais lu par Streamlit).
-- **Nouveau** : nettoyage robuste des volumes (espaces, virgules, valeurs invalides).
-- **Nouveau** : mise en cache (`st.cache_data`) du chargement et du clustering.
-- **Nouveau** : logique métier extraite dans `clustering.py`, testée par 8 tests unitaires.
-- **Nouveau** : `.gitignore` et licence MIT.
+- Fichier de thème déplacé vers `.streamlit/config.toml` (l'ancien emplacement
+  à la racine n'était jamais lu par Streamlit).
+- Nettoyage robuste des volumes (espaces, virgules, valeurs invalides).
+- Mise en cache (`st.cache_data`) du chargement et du clustering.
+- Logique métier extraite dans `clustering.py`, testée par des tests unitaires.
+- `.gitignore` et licence MIT.
+- **Nouveau** : déduplication automatique des mots-clés en double (volume max
+  conservé, relations fusionnées) avec avertissement dans l'UI, au lieu d'une
+  perte silencieuse de données.
+- **Nouveau** : détection et affichage des mots-clés "fantômes" (référencés
+  mais jamais présents comme ligne principale), avec volume cumulé non intégré.
+- **Nouveau** : garde-fou sur la taille de fichier (20 000 lignes max) pour
+  éviter un blocage de l'UI.
+- **Nouveau** : calcul de la similarité moyenne par cluster en O(E) au lieu de
+  O(k²) par cluster, avec test de non-régression de performance.
+- **Nouveau** : tests couvrant `streamlit_app.py` (fonctions d'orchestration
+  extraites du décorateur de cache, testables indépendamment de Streamlit).
+- **Nouveau** : intégration continue (GitHub Actions) exécutant la suite de
+  tests à chaque push et pull request.
 
 ## Installation locale
 
