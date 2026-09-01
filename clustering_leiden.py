@@ -7,15 +7,10 @@ communauté retournée est toujours connexe, pour une vitesse comparable ou
 meilleure.
 
 Ce module est volontairement séparé de clustering.py : il dépend de
-python-igraph et leidenalg, deux paquets plus lourds (igraph a une extension
+igraph et leidenalg, deux paquets plus lourds (igraph a une extension
 compilée) qui ne sont pour l'instant que des dépendances de développement
 (voir requirements-dev.txt), en attente de validation par la CI avant un
 éventuel passage en production à la place de build_clusters() (Louvain).
-
-Note d'implémentation : ce module n'a pas pu être exécuté ni testé localement
-au moment de son écriture (paquets non installables hors ligne) ; sa
-validation repose sur la suite de tests exécutée par la CI GitHub Actions,
-qui dispose d'un accès réseau pour installer les dépendances.
 """
 from __future__ import annotations
 
@@ -55,15 +50,21 @@ def build_clusters_leiden(df: pd.DataFrame, keyword_col: str, volume_col: str, e
     # de l'attribut a varié selon les versions ("_nx_name" ou "name").
     name_attr = "_nx_name" if "_nx_name" in ig_graph.vs.attributes() else "name"
 
-    partition = la.find_partition(
-        ig_graph,
-        la.RBConfigurationVertexPartition,
-        weights="weight",
-        seed=LEIDEN_SEED,
-    )
-    communities = [
-        {ig_graph.vs[idx][name_attr] for idx in community} for community in partition
-    ]
+    if ig_graph.ecount() > 0:
+        # leidenalg leve un KeyError sur l'attribut d'arete "weight" si le
+        # graphe n'a aucune arete (l'attribut n'a alors jamais ete cree).
+        partition = la.find_partition(
+            ig_graph,
+            la.RBConfigurationVertexPartition,
+            weights="weight",
+            seed=LEIDEN_SEED,
+        )
+        communities = [
+            {ig_graph.vs[idx][name_attr] for idx in community} for community in partition
+        ]
+    else:
+        # Aucune relation de similarite retenue : chaque mot-cle est isole.
+        communities = [{ig_graph.vs[idx][name_attr]} for idx in range(ig_graph.vcount())]
 
     community_index: dict[str, int] = {}
     for idx, members in enumerate(communities):
