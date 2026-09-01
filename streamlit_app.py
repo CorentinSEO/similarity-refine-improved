@@ -77,7 +77,7 @@ def main():
 
     uploaded_file = st.file_uploader("Choisissez un fichier", type=["xlsx", "xls", "csv"])
     if uploaded_file is None:
-        st.info("En attente d'un fichier .xlsx, .xls ou .csv.")
+        st.info("En attente d'un fichier .xlsx, .xls ou .csv (1000 lignes maximum).")
         return
 
     try:
