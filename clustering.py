@@ -8,6 +8,7 @@ from __future__ import annotations
 import io
 from typing import Iterable
 
+import networkx as nx
 import pandas as pd
 import re
 
@@ -15,10 +16,12 @@ REQUIRED_COLUMNS = ["Mot-clé", "Vol. mensuel", "Liste MC et %"]
 
 KEYWORD_PATTERN = re.compile(r"(.+?)\s*\((\d+)\)\s*:\s*([\d.,]+)\s*%")
 
-# Nombre maximal de lignes supportées par l'application dans cette version.
-# Au-delà, le clustering (comparaisons par paires au sein d'un même cluster)
-# peut devenir lent et l'UI Streamlit peu réactive.
-MAX_ROWS = 20000
+# Nombre maximal de lignes supportées par l'application (contrainte produit).
+MAX_ROWS = 1000
+
+# Graine fixe pour Louvain : résultats reproductibles d'un run à l'autre sur
+# un même fichier (l'algorithme est stochastique par défaut).
+LOUVAIN_SEED = 42
 
 
 # ---------------------------------------------------------------------------
@@ -42,11 +45,11 @@ def validate_columns(df: pd.DataFrame) -> list[str]:
 
 def validate_row_count(df: pd.DataFrame, max_rows: int = MAX_ROWS) -> str | None:
     """Retourne un message d'erreur si le fichier dépasse la taille maximale
-    supportée par cette version de l'application, sinon None."""
+    supportée par l'application, sinon None."""
     if len(df) > max_rows:
         return (
             f"Le fichier contient {len(df):,} lignes, ce qui dépasse la limite "
-            f"de {max_rows:,} lignes supportée par cette version de l'application. "
+            f"de {max_rows:,} lignes supportée par cette application. "
             "Scindez le fichier en plusieurs exports plus petits."
         ).replace(",", " ")
     return None
@@ -202,75 +205,70 @@ def summarize_row(entries: Iterable[tuple[str, int, float]]):
 
 
 # ---------------------------------------------------------------------------
-# Clustering par composantes connexes
+# Clustering par détection de communautés (Louvain)
 # ---------------------------------------------------------------------------
 
-class UnionFind:
-    """Structure union-find (disjoint-set) avec compression de chemin."""
-
-    def __init__(self, items: Iterable[str]):
-        self.parent = {item: item for item in items}
-
-    def find(self, x: str) -> str:
-        while self.parent[x] != x:
-            self.parent[x] = self.parent[self.parent[x]]
-            x = self.parent[x]
-        return x
-
-    def union(self, a: str, b: str) -> None:
-        ra, rb = self.find(a), self.find(b)
-        if ra != rb:
-            self.parent[ra] = rb
-
-
 def build_clusters(df: pd.DataFrame, keyword_col: str, volume_col: str, entries_col: str) -> pd.DataFrame:
-    """Regroupe les mots-clés en clusters (composantes connexes) à partir des
-    relations de similarité retenues, au lieu d'une simple suppression de
-    doublons un-à-un. Un cluster peut ainsi fusionner des chaînes A~B~C~D.
+    """Regroupe les mots-clés en clusters à partir des relations de
+    similarité retenues, via l'algorithme de Louvain (détection de
+    communautés par optimisation de modularité).
+
+    Historique : les versions précédentes utilisaient un simple clustering
+    par composantes connexes (union-find), qui fusionne tout mot-clé relié
+    par une chaîne de relations, même faibles. Sur des fichiers denses (avec
+    beaucoup de relations par mot-clé), cet effet de chaîne pouvait fusionner
+    des thématiques distinctes (ex. une entité ville et une entité région)
+    dès qu'un pont faible existait entre les deux, même au-dessus du seuil.
+
+    Louvain optimise la densité de connexions internes à chaque groupe
+    plutôt que de suivre n'importe quelle chaîne de relations : un pont
+    isolé et faible entre deux groupes densément connectés ne suffit plus à
+    les fusionner, ce qui produit des clusters plus cohérents
+    sémantiquement (voir test_build_clusters_resists_weak_bridge).
 
     Les mots-clés dupliqués dans keyword_col doivent avoir été fusionnés au
     préalable via deduplicate_keywords, sinon seule la dernière occurrence de
     volume sera retenue.
-
-    Note perf : le calcul de la similarité moyenne par cluster est fait en un
-    seul passage sur les arêtes (edge_similarities), et non par comparaison de
-    toutes les paires de membres d'un cluster. Cela évite une complexité
-    O(k²) par cluster (k = taille du cluster), qui devenait mesurable sur de
-    gros clusters (> 500 mots-clés fortement interconnectés).
     """
     known_keywords = set(df[keyword_col])
-    uf = UnionFind(known_keywords)
     edge_similarities: dict[tuple[str, str], float] = {}
 
     for _, row in df.iterrows():
         primary = row[keyword_col]
         for keyword, _volume, similarity in row[entries_col]:
             if keyword in known_keywords and keyword != primary:
-                uf.union(primary, keyword)
                 pair = tuple(sorted((primary, keyword)))
                 edge_similarities[pair] = max(edge_similarities.get(pair, 0), similarity)
 
-    clusters: dict[str, list[str]] = {}
-    for kw in known_keywords:
-        root = uf.find(kw)
-        clusters.setdefault(root, []).append(kw)
-
-    # Bucketing en un seul passage sur les arêtes (O(E)) au lieu de recomparer
-    # toutes les paires de chaque cluster (O(k²) par cluster).
-    cluster_similarities: dict[str, list[float]] = {}
+    graph = nx.Graph()
+    graph.add_nodes_from(known_keywords)
     for (a, b), similarity in edge_similarities.items():
-        root = uf.find(a)  # a et b sont dans le même cluster, même root
-        cluster_similarities.setdefault(root, []).append(similarity)
+        graph.add_edge(a, b, weight=similarity)
+
+    communities = nx.community.louvain_communities(graph, weight="weight", seed=LOUVAIN_SEED)
+
+    community_index: dict[str, int] = {}
+    for idx, members in enumerate(communities):
+        for member in members:
+            community_index[member] = idx
+
+    # Bucketing en un seul passage sur les arêtes (O(E)) pour la similarité
+    # moyenne par cluster, plutôt qu'une comparaison de toutes les paires.
+    cluster_similarities: dict[int, list[float]] = {}
+    for (a, b), similarity in edge_similarities.items():
+        idx = community_index[a]
+        cluster_similarities.setdefault(idx, []).append(similarity)
 
     volume_map = dict(zip(df[keyword_col], df[volume_col]))
     rows = []
-    for root, members in clusters.items():
+    for members in communities:
         members_sorted = sorted(members, key=lambda m: volume_map.get(m, 0), reverse=True)
         representative = members_sorted[0]
         merged = members_sorted[1:]
         total_volume = sum(volume_map.get(m, 0) for m in members_sorted)
 
-        sims = cluster_similarities.get(root, [])
+        idx = community_index[representative]
+        sims = cluster_similarities.get(idx, [])
         avg_sim = sum(sims) / len(sims) if sims else 0.0
 
         rows.append(
