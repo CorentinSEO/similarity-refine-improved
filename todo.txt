@@ -1,0 +1,6 @@
+1- DONE colonne qui concat les mots-clés du cluster (Mots-clés fusionnés)
+2- DONE clustering par composantes connexes (chaînes A~B~C)
+3- DONE support CSV en plus de l'Excel
+4- DONE export en mémoire (BytesIO)
+5- TODO pondération par intention de recherche
+6- TODO export du détail des similarités par paire
