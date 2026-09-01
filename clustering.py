@@ -1,19 +1,24 @@
 """Fonctions pures de parsing, nettoyage et clustering pour Similarity Refine.
 
 Ce module ne dépend pas de Streamlit afin de rester testable unitairement
-(voir tests/test_clustering.py) et réutilisable en dehors de l'UI.
+(voir test_clustering.py) et réutilisable en dehors de l'UI.
 """
 from __future__ import annotations
 
 import io
-import re
 from typing import Iterable
 
 import pandas as pd
+import re
 
 REQUIRED_COLUMNS = ["Mot-clé", "Vol. mensuel", "Liste MC et %"]
 
 KEYWORD_PATTERN = re.compile(r"(.+?)\s*\((\d+)\)\s*:\s*([\d.,]+)\s*%")
+
+# Nombre maximal de lignes supportées par l'application dans cette version.
+# Au-delà, le clustering (comparaisons par paires au sein d'un même cluster)
+# peut devenir lent et l'UI Streamlit peu réactive.
+MAX_ROWS = 20000
 
 
 # ---------------------------------------------------------------------------
@@ -35,6 +40,18 @@ def validate_columns(df: pd.DataFrame) -> list[str]:
     return [c for c in REQUIRED_COLUMNS if c not in df.columns]
 
 
+def validate_row_count(df: pd.DataFrame, max_rows: int = MAX_ROWS) -> str | None:
+    """Retourne un message d'erreur si le fichier dépasse la taille maximale
+    supportée par cette version de l'application, sinon None."""
+    if len(df) > max_rows:
+        return (
+            f"Le fichier contient {len(df):,} lignes, ce qui dépasse la limite "
+            f"de {max_rows:,} lignes supportée par cette version de l'application. "
+            "Scindez le fichier en plusieurs exports plus petits."
+        ).replace(",", " ")
+    return None
+
+
 def clean_volume_column(df: pd.DataFrame, volume_col: str = "Vol. mensuel") -> pd.DataFrame:
     """Nettoie la colonne de volume : supprime les espaces (séparateurs de
     milliers), remplace les virgules décimales et convertit en numérique.
@@ -50,6 +67,95 @@ def clean_volume_column(df: pd.DataFrame, volume_col: str = "Vol. mensuel") -> p
     )
     df[volume_col] = pd.to_numeric(cleaned, errors="coerce").fillna(0).astype(int)
     return df
+
+
+def deduplicate_keywords(
+    df: pd.DataFrame,
+    keyword_col: str = "Mot-clé",
+    volume_col: str = "Vol. mensuel",
+    entries_col: str = "Liste MC et %",
+) -> tuple[pd.DataFrame, list[str]]:
+    """Fusionne les lignes ayant le même mot-clé principal avant le clustering.
+
+    Sans cette étape, un mot-clé dupliqué dans le fichier source écrase
+    silencieusement le volume et les relations de similarité des autres
+    occurrences (seule la dernière ligne rencontrée est conservée). Cette
+    fonction :
+      - conserve le volume maximal parmi les occurrences dupliquées ;
+      - concatène toutes les relations de similarité listées pour ce mot-clé,
+        pour ne perdre aucune relation ;
+      - retourne la liste des mots-clés dupliqués détectés, pour affichage
+        d'un avertissement à l'utilisateur.
+    """
+    dup_mask = df[keyword_col].duplicated(keep=False)
+    duplicated_keywords = sorted(df.loc[dup_mask, keyword_col].astype(str).unique().tolist())
+    if not duplicated_keywords:
+        return df.reset_index(drop=True), []
+
+    order: list[str] = []
+    volumes: dict[str, float] = {}
+    entries: dict[str, list[str]] = {}
+
+    for _, row in df.iterrows():
+        kw = row[keyword_col]
+        vol = row[volume_col]
+        entry = row[entries_col]
+
+        if kw not in volumes:
+            order.append(kw)
+            volumes[kw] = vol if pd.notna(vol) else 0
+            entries[kw] = []
+        else:
+            if pd.notna(vol) and vol > volumes[kw]:
+                volumes[kw] = vol
+
+        if isinstance(entry, str) and entry.strip():
+            entries[kw].append(entry.strip())
+
+    deduped = pd.DataFrame(
+        {
+            keyword_col: order,
+            volume_col: [volumes[kw] for kw in order],
+            entries_col: [" | ".join(entries[kw]) for kw in order],
+        }
+    )
+    return deduped, duplicated_keywords
+
+
+def find_ghost_keywords(
+    df: pd.DataFrame,
+    keyword_col: str = "Mot-clé",
+    entries_col: str = "Liste MC et %",
+) -> list[tuple[str, int]]:
+    """Détecte les mots-clés référencés dans la colonne des relations de
+    similarité mais qui n'ont jamais leur propre ligne dans keyword_col.
+
+    Ces mots-clés "fantômes" sont ignorés par le clustering (aucun volume
+    propre disponible), ce qui peut sous-estimer silencieusement le volume
+    réel d'un cluster. Retourne la liste (mot-clé, volume rapporté dans la
+    relation) triée par volume décroissant, pour affichage d'un avertissement.
+    """
+    known = set(df[keyword_col])
+    ghosts: dict[str, int] = {}
+    for entries_str in df[entries_col]:
+        if not isinstance(entries_str, str) or not entries_str.strip():
+            continue
+        for chunk in entries_str.split("|"):
+            chunk = chunk.strip()
+            if not chunk:
+                continue
+            match = KEYWORD_PATTERN.match(chunk)
+            if not match:
+                continue
+            keyword, volume, _similarity = match.groups()
+            keyword = keyword.strip()
+            if keyword not in known:
+                try:
+                    volume = int(volume)
+                except ValueError:
+                    volume = 0
+                ghosts[keyword] = max(ghosts.get(keyword, 0), volume)
+    return sorted(ghosts.items(), key=lambda kv: kv[1], reverse=True)
 
 
 # ---------------------------------------------------------------------------
@@ -122,8 +228,15 @@ def build_clusters(df: pd.DataFrame, keyword_col: str, volume_col: str, entries_
     relations de similarité retenues, au lieu d'une simple suppression de
     doublons un-à-un. Un cluster peut ainsi fusionner des chaînes A~B~C~D.
 
-    Les mots-clés dupliqués dans keyword_col sont dédupliqués en amont ; le
-    dernier volume rencontré pour un doublon est celui conservé.
+    Les mots-clés dupliqués dans keyword_col doivent avoir été fusionnés au
+    préalable via deduplicate_keywords, sinon seule la dernière occurrence de
+    volume sera retenue.
+
+    Note perf : le calcul de la similarité moyenne par cluster est fait en un
+    seul passage sur les arêtes (edge_similarities), et non par comparaison de
+    toutes les paires de membres d'un cluster. Cela évite une complexité
+    O(k²) par cluster (k = taille du cluster), qui devenait mesurable sur de
+    gros clusters (> 500 mots-clés fortement interconnectés).
     """
     known_keywords = set(df[keyword_col])
     uf = UnionFind(known_keywords)
@@ -142,20 +255,22 @@ def build_clusters(df: pd.DataFrame, keyword_col: str, volume_col: str, entries_
         root = uf.find(kw)
         clusters.setdefault(root, []).append(kw)
 
+    # Bucketing en un seul passage sur les arêtes (O(E)) au lieu de recomparer
+    # toutes les paires de chaque cluster (O(k²) par cluster).
+    cluster_similarities: dict[str, list[float]] = {}
+    for (a, b), similarity in edge_similarities.items():
+        root = uf.find(a)  # a et b sont dans le même cluster, même root
+        cluster_similarities.setdefault(root, []).append(similarity)
+
     volume_map = dict(zip(df[keyword_col], df[volume_col]))
     rows = []
-    for members in clusters.values():
+    for root, members in clusters.items():
         members_sorted = sorted(members, key=lambda m: volume_map.get(m, 0), reverse=True)
         representative = members_sorted[0]
         merged = members_sorted[1:]
         total_volume = sum(volume_map.get(m, 0) for m in members_sorted)
 
-        sims = [
-            edge_similarities[tuple(sorted((a, b)))]
-            for i, a in enumerate(members_sorted)
-            for b in members_sorted[i + 1:]
-            if tuple(sorted((a, b))) in edge_similarities
-        ]
+        sims = cluster_similarities.get(root, [])
         avg_sim = sum(sims) / len(sims) if sims else 0.0
 
         rows.append(
