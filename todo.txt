@@ -7,5 +7,7 @@
 7- DONE cache Streamlit (st.cache_data)
 8- DONE tests unitaires pytest (clustering.py)
 9- DONE .gitignore + LICENSE MIT
-10- TODO pondération par intention de recherche
-11- TODO export du détail des similarités par paire
+10- TODO ponderation par intention de recherche
+11- TODO export du detail des similarites par paire
+12- DONE analyse multi-fichiers (import batch, traitement independant par fichier)
+13- DONE choix du format d'export (multi-feuilles ou agrege en 1 seule feuille)

@@ -213,19 +213,6 @@ def build_clusters(df: pd.DataFrame, keyword_col: str, volume_col: str, entries_
     similarité retenues, via l'algorithme de Louvain (détection de
     communautés par optimisation de modularité).
 
-    Historique : les versions précédentes utilisaient un simple clustering
-    par composantes connexes (union-find), qui fusionne tout mot-clé relié
-    par une chaîne de relations, même faibles. Sur des fichiers denses (avec
-    beaucoup de relations par mot-clé), cet effet de chaîne pouvait fusionner
-    des thématiques distinctes (ex. une entité ville et une entité région)
-    dès qu'un pont faible existait entre les deux, même au-dessus du seuil.
-
-    Louvain optimise la densité de connexions internes à chaque groupe
-    plutôt que de suivre n'importe quelle chaîne de relations : un pont
-    isolé et faible entre deux groupes densément connectés ne suffit plus à
-    les fusionner, ce qui produit des clusters plus cohérents
-    sémantiquement (voir test_build_clusters_resists_weak_bridge).
-
     Les mots-clés dupliqués dans keyword_col doivent avoir été fusionnés au
     préalable via deduplicate_keywords, sinon seule la dernière occurrence de
     volume sera retenue.
@@ -252,8 +239,6 @@ def build_clusters(df: pd.DataFrame, keyword_col: str, volume_col: str, entries_
         for member in members:
             community_index[member] = idx
 
-    # Bucketing en un seul passage sur les arêtes (O(E)) pour la similarité
-    # moyenne par cluster, plutôt qu'une comparaison de toutes les paires.
     cluster_similarities: dict[int, list[float]] = {}
     for (a, b), similarity in edge_similarities.items():
         idx = community_index[a]
@@ -271,19 +256,106 @@ def build_clusters(df: pd.DataFrame, keyword_col: str, volume_col: str, entries_
         sims = cluster_similarities.get(idx, [])
         avg_sim = sum(sims) / len(sims) if sims else 0.0
 
-        rows.append(
-            {
-                "Mot-clé principal": representative,
-                "Volume mot-clé principal": volume_map.get(representative, 0),
-                "Mots-clés fusionnés": ", ".join(merged) if merged else "",
-                "Nb mots-clés fusionnés": len(merged),
-                "Volume total du cluster": total_volume,
-                "Similarité moyenne (%)": round(avg_sim, 2),
-            }
-        )
+        rows.append({
+            "Mot-clé principal": representative,
+            "Volume mot-clé principal": volume_map.get(representative, 0),
+            "Mots-clés fusionnés": ", ".join(merged) if merged else "",
+            "Nb mots-clés fusionnés": len(merged),
+            "Volume total du cluster": total_volume,
+            "Similarité moyenne (%)": round(avg_sim, 2),
+        })
 
     result = pd.DataFrame(rows).sort_values("Volume total du cluster", ascending=False)
     return result.reset_index(drop=True)
+
+
+# ---------------------------------------------------------------------------
+# Traitement multi-fichiers (chaque fichier reste isolé des autres)
+# ---------------------------------------------------------------------------
+
+def process_dataframe(
+    df_raw: pd.DataFrame,
+    threshold: float,
+    source_label: str = "",
+    max_rows: int = MAX_ROWS,
+) -> dict:
+    """Exécute le pipeline complet (validation, dédoublonnage, mots-clés
+    fantômes, nettoyage, clustering Louvain) sur un seul DataFrame déjà
+    chargé.
+
+    Cette fonction est le point d'entrée utilisé pour analyser plusieurs
+    fichiers en une seule fois : chaque appel reste totalement indépendant
+    des autres, aucune relation de similarité n'est jamais comparée entre
+    deux fichiers différents.
+
+    Retourne un dict :
+      - "clusters" : DataFrame des clusters avec une colonne "Fichier source"
+        en première position, ou None si le fichier est invalide.
+      - "missing_columns" : colonnes obligatoires manquantes.
+      - "duplicated_keywords" : mots-clés dupliqués fusionnés automatiquement.
+      - "ghost_keywords" : mots-clés référencés mais jamais présents en ligne
+        principale (ignorés du clustering).
+      - "size_error" : message d'erreur si le fichier dépasse max_rows.
+      - "row_count" : nombre de lignes importées (avant dédoublonnage).
+    """
+    missing = validate_columns(df_raw)
+    if missing:
+        return {
+            "clusters": None,
+            "missing_columns": missing,
+            "duplicated_keywords": [],
+            "ghost_keywords": [],
+            "size_error": None,
+            "row_count": len(df_raw),
+        }
+
+    size_error = validate_row_count(df_raw, max_rows=max_rows)
+    if size_error:
+        return {
+            "clusters": None,
+            "missing_columns": [],
+            "duplicated_keywords": [],
+            "ghost_keywords": [],
+            "size_error": size_error,
+            "row_count": len(df_raw),
+        }
+
+    df_dedup, duplicated_keywords = deduplicate_keywords(df_raw)
+    ghost_keywords = find_ghost_keywords(df_dedup)
+    df_clean = clean_volume_column(df_dedup, "Vol. mensuel")
+
+    df_clean = df_clean.copy()
+    df_clean["_entries"] = df_clean["Liste MC et %"].apply(lambda x: parse_keywords(x, threshold))
+    clusters = build_clusters(df_clean, "Mot-clé", "Vol. mensuel", "_entries")
+    clusters.insert(0, "Fichier source", source_label)
+
+    return {
+        "clusters": clusters,
+        "missing_columns": [],
+        "duplicated_keywords": duplicated_keywords,
+        "ghost_keywords": ghost_keywords,
+        "size_error": None,
+        "row_count": len(df_raw),
+    }
+
+
+def combine_cluster_results(results_by_file: "dict[str, pd.DataFrame | None]") -> pd.DataFrame:
+    """Concatène les tableaux de clusters de plusieurs fichiers déjà traités
+    indépendamment (voir process_dataframe) en un seul tableau de résultats,
+    portant la colonne "Fichier source" pour tracer l'origine de chaque
+    cluster.
+
+    Ne recalcule et ne mélange aucune similarité entre fichiers : chaque
+    ligne du résultat combiné provient d'un clustering réalisé isolément sur
+    son propre fichier.
+    """
+    frames = [df for df in results_by_file.values() if df is not None and not df.empty]
+    if not frames:
+        return pd.DataFrame()
+    combined = pd.concat(frames, ignore_index=True)
+    return combined.sort_values(
+        ["Fichier source", "Volume total du cluster"], ascending=[True, False]
+    ).reset_index(drop=True)
 
 
 # ---------------------------------------------------------------------------
@@ -291,8 +363,41 @@ def build_clusters(df: pd.DataFrame, keyword_col: str, volume_col: str, entries_
 # ---------------------------------------------------------------------------
 
 def to_excel_bytes(df: pd.DataFrame) -> bytes:
-    """Génère un fichier Excel en mémoire (aucune écriture disque)."""
+    """Génère un fichier Excel en mémoire (aucune écriture disque), une
+    seule feuille "Clusters". Utilisé pour l'export mono-fichier, ou pour
+    l'export multi-fichiers en mode "agrégé" (une seule feuille combinée)."""
     buffer = io.BytesIO()
     with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
         df.to_excel(writer, index=False, sheet_name="Clusters")
+    return buffer.getvalue()
+
+
+def _safe_sheet_name(name: str, used_names: set) -> str:
+    """Nettoie un nom de feuille Excel (31 caractères max, caractères
+    interdits remplacés) et garantit son unicité dans le classeur."""
+    forbidden = set('[]:*?/\\')
+    cleaned = "".join(c if c not in forbidden else "_" for c in str(name))[:31]
+    base = cleaned or "Feuille"
+    candidate = base
+    suffix = 1
+    while candidate in used_names:
+        suffix_str = f"_{suffix}"
+        candidate = base[: 31 - len(suffix_str)] + suffix_str
+        suffix += 1
+    used_names.add(candidate)
+    return candidate
+
+
+def to_excel_bytes_multi(sheets: "dict[str, pd.DataFrame]") -> bytes:
+    """Génère un classeur Excel unique en mémoire (aucune écriture disque)
+    avec une feuille par entrée du dict `sheets`. Utilisé pour l'export
+    multi-fichiers en mode "multi-feuilles" (une feuille par fichier source,
+    plus une feuille combinée), dans l'ordre fourni.
+    """
+    buffer = io.BytesIO()
+    used_names: set = set()
+    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+        for name, df in sheets.items():
+            safe_name = _safe_sheet_name(name, used_names)
+            df.to_excel(writer, index=False, sheet_name=safe_name)
     return buffer.getvalue()
