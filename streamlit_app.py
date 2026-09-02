@@ -3,14 +3,67 @@ import pandas as pd
 
 from clustering import (
     REQUIRED_COLUMNS,
+    build_clusters,
+    clean_volume_column,
     combine_cluster_results,
+    deduplicate_keywords,
+    find_ghost_keywords,
+    load_uploaded_file,
+    parse_keywords,
     process_dataframe,
+    summarize_row,
     to_excel_bytes,
     to_excel_bytes_multi,
-    load_uploaded_file,
+    validate_columns,
+    validate_row_count,
 )
 
 st.set_page_config(page_title="Similarity Refine", layout="wide")
+
+
+def _load_and_clean_impl(file_bytes: bytes, file_name: str):
+    """Charge, valide et nettoie un fichier importé (comportement mono-fichier
+    conservé à l'identique des versions précédentes, pour compatibilité avec
+    test_clustering.py). Le flux multi-fichiers de main() utilise désormais
+    process_dataframe / _process_uploaded_file_impl ci-dessous, qui encapsule
+    une logique équivalente réutilisable par fichier.
+
+    Retourne (df_nettoyé, colonnes_manquantes, mots_clés_dupliqués,
+    mots_clés_fantômes, message_erreur_taille).
+    """
+    import io
+
+    class _NamedBytes(io.BytesIO):
+        name = file_name
+
+    uploaded = _NamedBytes(file_bytes)
+    uploaded.name = file_name
+    df = load_uploaded_file(uploaded)
+
+    missing = validate_columns(df)
+    if missing:
+        return df, missing, [], [], None
+
+    size_error = validate_row_count(df)
+    if size_error:
+        return df, missing, [], [], size_error
+
+    df, duplicated_keywords = deduplicate_keywords(df)
+    ghost_keywords = find_ghost_keywords(df)
+    df = clean_volume_column(df, "Vol. mensuel")
+    return df, missing, duplicated_keywords, ghost_keywords, None
+
+
+def _cluster_impl(df: pd.DataFrame, threshold: float) -> pd.DataFrame:
+    """Parsing + clustering pour un DataFrame déjà nettoyé (conservé pour
+    compatibilité avec test_clustering.py)."""
+    df = df.copy()
+    df["_entries"] = df["Liste MC et %"].apply(lambda x: parse_keywords(x, threshold))
+    summary = df["_entries"].apply(summarize_row)
+    df[["Mots-clés filtrés", "Volume secondaire", "Similarité moyenne brute", "Nb mots-clés filtrés"]] = pd.DataFrame(
+        summary.tolist(), index=df.index
+    )
+    return build_clusters(df, "Mot-clé", "Vol. mensuel", "_entries")
 
 
 def _process_uploaded_file_impl(file_bytes: bytes, file_name: str, threshold: float) -> dict:
